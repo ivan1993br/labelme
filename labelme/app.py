@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 
 import functools
-import math
 import os
 import os.path as osp
 import re
 import webbrowser
+import cv2
+import numpy as np
 
 import imgviz
 from qtpy import QtCore
@@ -33,6 +34,20 @@ from labelme.widgets import UniqueLabelQListWidget
 from labelme.widgets import ZoomWidget
 
 
+
+def convertQImageToMat(incomingImage):
+    '''  Converts a QImage into an opencv MAT format  '''
+
+    incomingImage = incomingImage.convertToFormat(4)
+
+    width = incomingImage.width()
+    height = incomingImage.height()
+
+    ptr = incomingImage.bits()
+    ptr.setsize(incomingImage.byteCount())
+    arr = np.array(ptr).reshape(height, width, 4)  #  Copies the data
+    return arr
+
 # FIXME
 # - [medium] Set max zoom value to something big enough for FitWidth/Window
 
@@ -58,6 +73,7 @@ class MainWindow(QtWidgets.QMainWindow):
         output_file=None,
         output_dir=None,
     ):
+        self.cv_prev_image = None
         if output is not None:
             logger.warning(
                 "argument output is deprecated, use output_file instead"
@@ -314,6 +330,16 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         toggle_keep_prev_mode.setChecked(self._config["keep_prev"])
 
+        toggle_follow_image_mode = action(
+            self.tr("Follow Image with Annotation"),
+            self.toggleFollowImageMode,
+            shortcuts["toggle_follow_image_mode"],
+            None,
+            self.tr('Toggle "Follow Image with Annotation" mode'),
+            checkable=True,
+        )
+        toggle_follow_image_mode.setChecked(self._config["follow_image"])
+
         createMode = action(
             self.tr("Create Polygons"),
             lambda: self.toggleDrawMode(False, createMode="polygon"),
@@ -564,6 +590,7 @@ class MainWindow(QtWidgets.QMainWindow):
             close=close,
             deleteFile=deleteFile,
             toggleKeepPrevMode=toggle_keep_prev_mode,
+            toggleFollowImageMode=toggle_follow_image_mode,
             delete=delete,
             edit=edit,
             copy=copy,
@@ -602,6 +629,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 addPointToEdge,
                 None,
                 toggle_keep_prev_mode,
+                toggle_follow_image_mode,
             ),
             # menu shown at right click
             menu=(
@@ -1146,9 +1174,11 @@ class MainWindow(QtWidgets.QMainWindow):
             item = self.labelList.findItemByShape(shape)
             self.labelList.removeItem(item)
 
-    def loadShapes(self, shapes, replace=True):
+    def loadShapes(self, shapes, replace=True, offset=None):
         self._noSelectionSlot = True
         for shape in shapes:
+            if offset is not None:
+                shape.moveBy(offset)
             self.addLabel(shape)
         self.labelList.clearSelection()
         self._noSelectionSlot = False
@@ -1332,12 +1362,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.zoom_values[self.filename] = (self.zoomMode, value)
 
     def addZoom(self, increment=1.1):
-        zoom_value = self.zoomWidget.value() * increment
-        if increment > 1:
-            zoom_value = math.ceil(zoom_value)
-        else:
-            zoom_value = math.floor(zoom_value)
-        self.setZoom(zoom_value)
+        self.setZoom(self.zoomWidget.value() * increment)
 
     def zoomRequest(self, delta, pos):
         canvas_width_old = self.canvas.width()
@@ -1455,6 +1480,38 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.imagePath = filename
             self.labelFile = None
         image = QtGui.QImage.fromData(self.imageData)
+        
+        
+        prev_shape_offset = None
+        print(self._config["follow_image"])
+        if self._config["follow_image"]:
+            cv_image = convertQImageToMat(image)
+
+            if self.cv_prev_image is not None:
+                cv_image_gray = cv2.cvtColor(cv_image,cv2.COLOR_BGR2GRAY)
+                cv_prev_image_gray = cv2.cvtColor(self.cv_prev_image,cv2.COLOR_BGR2GRAY)
+                cv_flow = cv2.calcOpticalFlowFarneback(cv_prev_image_gray,cv_image_gray, None, 0.5, 3, 100, 3, 5, 1.2, 0)
+                x_mean = np.mean(cv_flow[...,0])
+                y_mean = np.mean(cv_flow[...,1])
+                x_std = np.std(cv_flow[...,0])
+                y_std = np.std(cv_flow[...,1])
+                x_max = np.max(cv_flow[...,0])
+                y_max = np.max(cv_flow[...,1])
+                x_min = np.min(cv_flow[...,0])
+                y_min = np.min(cv_flow[...,1])
+                x_size = len(cv_flow[...,0])
+                y_size = len(cv_flow[...,1])
+                x_median = np.median(cv_flow[...,0])
+                y_median = np.median(cv_flow[...,1])
+                prev_shape_offset = QtCore.QPointF(x_mean, y_mean)
+                print("Offsest mean ", x_mean, y_mean)
+                print("Offsest median ", x_median, y_median)
+                print("Offsest std ", x_std, y_std)
+                print("Offsest max ", x_max, y_max)
+                print("Offsest min ", x_min, y_min)
+                print("Offsest size ", x_size, y_size)
+
+
 
         if image.isNull():
             formats = [
@@ -1471,6 +1528,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.status(self.tr("Error reading %s") % filename)
             return False
         self.image = image
+        self.prev_image = image
         self.filename = filename
         if self._config["keep_prev"]:
             prev_shapes = self.canvas.shapes
@@ -1482,7 +1540,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 flags.update(self.labelFile.flags)
         self.loadFlags(flags)
         if self._config["keep_prev"] and self.noShapes():
-            self.loadShapes(prev_shapes, replace=False)
+            self.loadShapes(prev_shapes, replace=False, offset=prev_shape_offset)
             self.setDirty()
         else:
             self.setClean()
@@ -1528,6 +1586,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.addRecentFile(self.filename)
         self.toggleActions(True)
         self.status(self.tr("Loaded %s") % osp.basename(str(filename)))
+        self.cv_prev_image = convertQImageToMat(image)
         return True
 
     def resizeEvent(self, event):
@@ -1859,6 +1918,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def toggleKeepPrevMode(self):
         self._config["keep_prev"] = not self._config["keep_prev"]
+
+    def toggleFollowImageMode(self):
+        self._config["follow_image"] = not self._config["follow_image"]
 
     def deleteSelectedShape(self):
         yes, no = QtWidgets.QMessageBox.Yes, QtWidgets.QMessageBox.No
